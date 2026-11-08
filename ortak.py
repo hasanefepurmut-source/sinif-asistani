@@ -321,6 +321,11 @@ YEDEK_MODELLER: list[str] = []
 # Yoğunluk (503) hatasında aynı model kaç kez denensin, aralarında kaç saniye beklensin.
 YOGUNLUK_DENEME_SAYISI = 2
 YOGUNLUK_BEKLEME_SN = 2
+# Google'ın tek bir cevabı için en fazla bekleme (saniye). Varsayılan "sınırsız"
+# olduğundan, bağlantı takılırsa sayfa sonsuza kadar beklerdi.
+ISTEK_ZAMAN_ASIMI_SN = 40
+# Bir soru için tüm denemelerin toplam süre sınırı (saniye).
+TOPLAM_SURE_SN = 90
 # Bir kez çalıştığı görülen model hatırlanır (her soruda tekrar aranmasın).
 _CALISAN_MODEL: dict[str, str] = {}
 
@@ -356,6 +361,9 @@ def hata_aciklamasi(hata: Exception) -> str:
                 "ve belgeleri tekrar yükle.")
     if kod == 404:
         return "Model bulunamadı. GEMINI_MODEL ayarıyla güncel bir model adı ver."
+    if _zaman_asimi_mi(hata):
+        return ("Google zamanında cevap vermedi (sunucular yoğun ya da bağlantı yavaş). "
+                "Birkaç dakika sonra tekrar dene.")
     if kod and kod >= 500:
         return "Google tarafında geçici bir sorun var. Birkaç dakika sonra tekrar dene."
     return "Beklenmeyen bir hata."
@@ -370,10 +378,18 @@ def _model_hatasi_mi(hata: Exception) -> bool:
     return kod in (400, 404)
 
 
+def _zaman_asimi_mi(hata: Exception) -> bool:
+    """Bağlantı / cevap zaman aşımı mı? (httpx ConnectTimeout, ReadTimeout vb.)"""
+    if isinstance(hata, TimeoutError):
+        return True
+    return any("Timeout" in sinif.__name__ for sinif in type(hata).__mro__)
+
+
 def _gecici_hata_mi(hata: Exception) -> bool:
-    """Google tarafında geçici sorun mu? (yoğunluk / sunucu hatası)"""
+    """Google tarafında geçici sorun mu? (yoğunluk / sunucu hatası / zaman aşımı)"""
     kod = getattr(hata, "code", None)
-    return kod in (500, 502, 503, 504) or "UNAVAILABLE" in str(hata)
+    return (kod in (500, 502, 503, 504) or "UNAVAILABLE" in str(hata)
+            or _zaman_asimi_mi(hata))
 
 
 class Asistan:
@@ -390,7 +406,8 @@ class Asistan:
 
         adaylar = []
         try:
-            for m in self.istemci.models.list():
+            for m in self.istemci.models.list(
+                    config={"http_options": {"timeout": 20_000}}):
                 ad = (m.name or "").removeprefix("models/")
                 eylemler = m.supported_actions or []
                 if "flash" not in ad or "generateContent" not in eylemler:
@@ -423,14 +440,18 @@ class Asistan:
             if len(denenen) >= 3:
                 return
 
-    def _cagir(self, model, icerik, ayar_):
-        """Modeli çağırır; yoğunluk hatasında kısa bekleyip tekrar dener."""
+    def _cagir(self, model, icerik, ayar_, bitis: float):
+        """Modeli çağırır; yoğunluk (503) hatasında kısa bekleyip tekrar dener.
+        Zaman aşımında aynı modeli tekrar beklemez (çok uzun sürerdi)."""
         for deneme in range(YOGUNLUK_DENEME_SAYISI):
             try:
                 return self.istemci.models.generate_content(
                     model=model, contents=icerik, config=ayar_)
             except Exception as hata:  # noqa: BLE001
-                if not _gecici_hata_mi(hata) or deneme == YOGUNLUK_DENEME_SAYISI - 1:
+                son_deneme = deneme == YOGUNLUK_DENEME_SAYISI - 1
+                sure_kalmadi = time.time() + YOGUNLUK_BEKLEME_SN * 2 > bitis
+                if (not _gecici_hata_mi(hata) or _zaman_asimi_mi(hata)
+                        or son_deneme or sure_kalmadi):
                     raise
                 time.sleep(YOGUNLUK_BEKLEME_SN * (deneme + 1))
 
@@ -449,13 +470,17 @@ class Asistan:
             system_instruction=sistem_talimati(dil),
             temperature=0.1,
             tools=[types.Tool(file_search=types.FileSearch(file_search_store_names=[self.depo]))],
+            http_options=types.HttpOptions(timeout=ISTEK_ZAMAN_ASIMI_SN * 1000),
         )
 
+        bitis = time.time() + TOPLAM_SURE_SN
         son_hata, son_model = None, self.model
         for model in self._model_sirasi():
+            if son_hata is not None and time.time() + 5 > bitis:
+                break  # süre bitti; yeni modele geçmeden kullanıcıya haber ver
             son_model = model
             try:
-                yanit = self._cagir(model, icerik, ayar_)
+                yanit = self._cagir(model, icerik, ayar_, bitis)
             except Exception as hata:  # noqa: BLE001
                 if kota_hatasi_mi(hata):
                     return Cevap(mesaj("kota", dil), hata=True)
