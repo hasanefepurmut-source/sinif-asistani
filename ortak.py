@@ -350,6 +350,14 @@ def hata_aciklamasi(hata: Exception) -> str:
     """Teknik hatayı yöneticinin anlayacağı Türkçe bir açıklamaya çevirir."""
     kod = getattr(hata, "code", None)
     msj = str(hata).lower()
+    if kota_hatasi_mi(hata):
+        if "limit: 0" in msj:
+            return ("Bu model ücretsiz katmanda kullanılamıyor (kota sınırı 0). Uygulama başka "
+                    "modelleri de denedi. AI Studio → Rate limits sayfasından hangi modellerin "
+                    "ücretsiz olduğuna bak ve GEMINI_MODEL ayarıyla onu seç.")
+        return ("Gemini ücretsiz soru hakkı doldu. Dakikalık sınır 1 dakikada, günlük sınır "
+                "Türkiye saatiyle sabah 10-11 civarında sıfırlanır. Kullanımı AI Studio → "
+                "Usage / Rate limits sayfasından görebilirsin.")
     if "api key" in msj or "api_key" in msj or kod == 401:
         return ("API anahtarı geçersiz ya da bu API için uygun değil. "
                 "aistudio.google.com → Get API key bölümünden yeni bir anahtar al.")
@@ -475,6 +483,8 @@ class Asistan:
 
         bitis = time.time() + TOPLAM_SURE_SN
         son_hata, son_model = None, self.model
+        kalici_degisim = True  # sadece "model yok" yüzünden geçildiyse hatırla
+        hatalar: list[str] = []
         for model in self._model_sirasi():
             if son_hata is not None and time.time() + 5 > bitis:
                 break  # süre bitti; yeni modele geçmeden kullanıcıya haber ver
@@ -482,22 +492,30 @@ class Asistan:
             try:
                 yanit = self._cagir(model, icerik, ayar_, bitis)
             except Exception as hata:  # noqa: BLE001
-                if kota_hatasi_mi(hata):
-                    return Cevap(mesaj("kota", dil), hata=True)
                 son_hata = hata
+                hatalar.append(f"{model}: {type(hata).__name__}: {str(hata)[:400]}")
                 hata_kaydet(f"Model {model}: {type(hata).__name__}: {hata}")
-                if _model_hatasi_mi(hata) or _gecici_hata_mi(hata):
-                    continue  # başka bir modelle dene
+                if kota_hatasi_mi(hata) or _gecici_hata_mi(hata):
+                    kalici_degisim = False  # geçici durum; yarın asıl model yine denensin
+                    continue  # kotalar model başına ayrı: başka modelle dene
+                if _model_hatasi_mi(hata):
+                    continue
                 break
             if model != self.model:
-                _CALISAN_MODEL[self.model] = model
-                hata_kaydet(f"Bilgi: '{self.model}' yerine '{model}' modeli kullanılıyor.")
+                if kalici_degisim:
+                    _CALISAN_MODEL[self.model] = model
+                hata_kaydet(f"Bilgi: '{self.model}' yerine '{model}' modeli kullanıldı.")
             return cevabi_denetle(yanit.text or "", kaynaklari_cikar(yanit), dil)
 
         print(f"[HATA] Gemini çağrısı başarısız: {son_hata!r}")
-        ayrinti = (f"{hata_aciklamasi(son_hata)}\n\nModel: {son_model}\n"
-                   f"{type(son_hata).__name__}: {son_hata}")[:1500]
-        tur = "yogunluk" if _gecici_hata_mi(son_hata) else "genel"
+        ayrinti = (f"{hata_aciklamasi(son_hata)}\n\nDenenen modeller:\n"
+                   + "\n".join(hatalar))[:2500]
+        if kota_hatasi_mi(son_hata):
+            tur = "kota"
+        elif _gecici_hata_mi(son_hata):
+            tur = "yogunluk"
+        else:
+            tur = "genel"
         return Cevap(mesaj(tur, dil), hata=True, ayrinti=ayrinti)
 
 
