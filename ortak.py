@@ -328,6 +328,20 @@ ISTEK_ZAMAN_ASIMI_SN = 40
 TOPLAM_SURE_SN = 90
 # Bir kez çalıştığı görülen model hatırlanır (her soruda tekrar aranmasın).
 _CALISAN_MODEL: dict[str, str] = {}
+# Bir soru için en fazla kaç farklı model denensin. (Ücretsiz katmanda her modelin
+# günlük hakkı ayrıdır; kota/yok hataları anında döndüğü için çok model denemek ucuzdur.)
+EN_FAZLA_MODEL = 6
+# Geçici olarak atlanacak modeller: model -> bu zamana kadar atla (time.time()).
+# Hakkı dolan ya da kapatılmış modele her soruda boşuna istek gönderilmesin.
+_ATLANACAK: dict[str, float] = {}
+ATLA_DAKIKALIK_KOTA_SN = 60
+ATLA_GUNLUK_KOTA_SN = 3600      # saatte bir tekrar bakılır (günlük hak sıfırlanmış olabilir)
+ATLA_MODEL_YOK_SN = 24 * 3600
+
+
+def _gunluk_kota_mi(hata: Exception) -> bool:
+    msj = str(hata).lower().replace(" ", "").replace("_", "")
+    return "perday" in msj or "requestsperday" in msj or "daily" in msj
 
 HATA_KAYDI_DOSYASI = PROJE_KLASORU / "hata_kaydi.txt"
 
@@ -432,9 +446,11 @@ class Asistan:
         return [a[3] for a in sorted(adaylar, reverse=True)]
 
     def _model_sirasi(self):
-        """Denenecek modelleri sırayla verir (en fazla 3 farklı model).
+        """Denenecek modelleri sırayla verir (en fazla EN_FAZLA_MODEL farklı model).
+        Hakkı dolmuş / kapatılmış modeller geçici olarak atlanır.
         Hesaptaki modeller ancak ilk adaylar başarısız olursa sorgulanır."""
-        denenen: list[str] = []
+        gorulen: list[str] = []
+        simdi = time.time()
 
         def adaylar():
             yield _CALISAN_MODEL.get(self.model, self.model)
@@ -442,11 +458,12 @@ class Asistan:
             yield from self._hesaptaki_flash_modelleri()
 
         for ad in adaylar():
-            if ad and ad not in denenen:
-                denenen.append(ad)
-                yield ad
-            if len(denenen) >= 3:
-                return
+            if not ad or ad in gorulen:
+                continue
+            gorulen.append(ad)
+            if _ATLANACAK.get(ad, 0) > simdi:
+                continue
+            yield ad
 
     def _cagir(self, model, icerik, ayar_, bitis: float):
         """Modeli çağırır; yoğunluk (503) hatasında kısa bekleyip tekrar dener.
@@ -483,29 +500,49 @@ class Asistan:
 
         bitis = time.time() + TOPLAM_SURE_SN
         son_hata, son_model = None, self.model
-        kalici_degisim = True  # sadece "model yok" yüzünden geçildiyse hatırla
+        # Yedek model sadece asıl model gerçekten "yok" (404) olduğu için seçildiyse
+        # kalıcı hatırlanır; kota/yoğunluk/atlama yüzünden seçildiyse hatırlanmaz.
+        model_yok_goruldu = False
+        gecici_sorun_goruldu = False
         hatalar: list[str] = []
+        denenen = 0
         for model in self._model_sirasi():
+            if denenen >= EN_FAZLA_MODEL:
+                break
             if son_hata is not None and time.time() + 5 > bitis:
                 break  # süre bitti; yeni modele geçmeden kullanıcıya haber ver
+            denenen += 1
             son_model = model
             try:
                 yanit = self._cagir(model, icerik, ayar_, bitis)
             except Exception as hata:  # noqa: BLE001
                 son_hata = hata
-                hatalar.append(f"{model}: {type(hata).__name__}: {str(hata)[:400]}")
+                hatalar.append(f"{model}: {type(hata).__name__}: {str(hata)[:300]}")
                 hata_kaydet(f"Model {model}: {type(hata).__name__}: {hata}")
-                if kota_hatasi_mi(hata) or _gecici_hata_mi(hata):
-                    kalici_degisim = False  # geçici durum; yarın asıl model yine denensin
+                if kota_hatasi_mi(hata):
+                    gecici_sorun_goruldu = True  # asıl model sonra yine denensin
+                    sure = ATLA_GUNLUK_KOTA_SN if _gunluk_kota_mi(hata) else ATLA_DAKIKALIK_KOTA_SN
+                    _ATLANACAK[model] = time.time() + sure
                     continue  # kotalar model başına ayrı: başka modelle dene
+                if _gecici_hata_mi(hata):
+                    gecici_sorun_goruldu = True
+                    continue
                 if _model_hatasi_mi(hata):
+                    model_yok_goruldu = True
+                    _ATLANACAK[model] = time.time() + ATLA_MODEL_YOK_SN
                     continue
                 break
             if model != self.model:
-                if kalici_degisim:
+                if model_yok_goruldu and not gecici_sorun_goruldu:
                     _CALISAN_MODEL[self.model] = model
                 hata_kaydet(f"Bilgi: '{self.model}' yerine '{model}' modeli kullanıldı.")
             return cevabi_denetle(yanit.text or "", kaynaklari_cikar(yanit), dil)
+
+        if son_hata is None:
+            # Hiç model denenmedi: hepsi geçici olarak atlanıyor (hakları dolu).
+            ayrinti = ("Kullanılabilen tüm modellerin soru hakkı şu an dolu. Uygulama "
+                       "dakikalık hakları 1 dakika, günlük hakları 1 saat sonra tekrar dener.")
+            return Cevap(mesaj("kota", dil), hata=True, ayrinti=ayrinti)
 
         print(f"[HATA] Gemini çağrısı başarısız: {son_hata!r}")
         ayrinti = (f"{hata_aciklamasi(son_hata)}\n\nDenenen modeller:\n"
